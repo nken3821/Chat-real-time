@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rocket = { version = "0.5.1", features = ["json"] }
+dotenvy = "0.15.7"
+chrono = { version = "0.4.45", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+futures-util = "0.3.34"
+ws = { package = "rocket_ws", version = "0.1.1" }
+tokio = { version = "1", features = ["sync"] }
+uuid = { version = "1.18.1", features = ["v4"] }
