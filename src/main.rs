@@ -1,14 +1,15 @@
-#[macro_use] extern crate rocket;
+#[macro_use]
+extern crate rocket;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
-use rocket::serde::json::serde_json;
 use rocket::State;
+use rocket::serde::json::serde_json;
 use serde::{Deserialize, Serialize};
-use ws::{Channel, WebSocket};
-use tokio::sync::{broadcast, RwLock, mpsc};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use tokio::sync::{RwLock, broadcast, mpsc};
 use uuid::Uuid;
+use ws::{Channel, WebSocket};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ChatMessage {
@@ -16,7 +17,21 @@ struct ChatMessage {
     content: String,
     username: String,
     users: Vec<String>,
-    to: Option<String>
+    to: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MessageType {
+    Message,
+    PrivateMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct IncomingMessage {
+    message_type: MessageType,
+    content: String,
+    to: Option<String>,
 }
 
 struct Client {
@@ -26,7 +41,8 @@ struct Client {
 
 struct Room {
     sender: broadcast::Sender<ChatMessage>,
-    clients: HashMap<String, Client>
+    clients: HashMap<String, Client>,
+    history: VecDeque<ChatMessage>,
 }
 
 struct RoomManager {
@@ -41,21 +57,24 @@ impl RoomManager {
     }
 
     fn get_or_create_room(&mut self, room_id: &str) -> &mut Room {
-        self.rooms
-            .entry(room_id.to_string())
-            .or_insert_with(|| {
-                let (sender, _) = broadcast::channel(100);
-                Room {
-                    sender,
-                    clients: HashMap::new()
-                }
-            })
+        self.rooms.entry(room_id.to_string()).or_insert_with(|| {
+            let (sender, _) = broadcast::channel(100);
+            Room {
+                sender,
+                clients: HashMap::new(),
+                history: VecDeque::new(),
+            }
+        })
     }
 }
 
 #[get("/ws/<room_id>/<user_name>")]
-fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<Arc<RwLock<RoomManager>>>) -> Channel<'static>{
-
+fn websocket(
+    ws: WebSocket,
+    room_id: &str,
+    user_name: &str,
+    manager: &State<Arc<RwLock<RoomManager>>>,
+) -> Channel<'static> {
     let connection_id = Uuid::new_v4().to_string();
 
     let manager = manager.inner().clone();
@@ -75,8 +94,9 @@ fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<Arc<
             // Join room
             // =========================================
 
-            let (sender, users) = {
+            let (sender, users, history) = {
                 let mut manager = manager.write().await;
+
                 let room = manager.get_or_create_room(&room_id);
                 room.clients.insert(
                     connection_id.clone(),
@@ -93,12 +113,27 @@ fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<Arc<
                     .into_iter()
                     .collect::<Vec<_>>();
 
-                (room.sender.clone(), users)
+                let history = room.history.iter().cloned().collect::<Vec<_>>();
 
+                (room.sender.clone(), users, history)
             };
 
             // Subscribe to room broadcast
             let mut receiver = sender.subscribe();
+
+            for history_manager in history {
+                match serde_json::to_string(&history_manager) {
+                    Ok(json) => {
+                        if let Err(error) = stream.send(json.into()).await {
+                            println!("[Room: {}] History send error: {}", room_id, error);
+                           break;
+                        }
+                    }
+                    Err(error) => {
+                        println!("[Room: {}] History serialization error: {}", room_id, error);
+                    }
+                }
+            }
 
             // Notify room that user joined
             let _ = sender.send(ChatMessage {
@@ -118,7 +153,7 @@ fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<Arc<
                 content: String::new(),
                 users,
                 to: None
-            };  
+            };
 
             if let Ok(json) = serde_json::to_string(&users_message) {
                 let _ = stream.send(json.into()).await;
@@ -133,87 +168,190 @@ fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<Arc<
                    // =================================
                    // 1. Client -> Server
                    // =================================
-
                     message = stream.next() => {
                         match message {
+
                             Some(Ok(message)) => {
-                                println!("[Room:{}] [{}] Received: {:?}", room_id, user_name, message);
+
+                                println!(
+                                    "[Room:{}] [{}] Received: {:?}",
+                                    room_id,
+                                    user_name,
+                                    message
+                                );
 
                                 if let Ok(text) = message.to_text() {
-                                   #[derive(Debug, Deserialize)]
-                                    struct IncomingMessage {
-                                       message_type: String,
-                                       content: String,
-                                       to: Option<String>
-                                   }
+
                                     match serde_json::from_str::<IncomingMessage>(text) {
 
-                                       Ok(incoming) => {
+                                        Ok(incoming) => {
 
-                                           // =================================
-                                           // Normal room message
-                                           // =================================
-                                           if incoming.message_type == "message" {
-                                                   let chat_message = ChatMessage {
-                                                   message_type: incoming.message_type,
-                                                   content: incoming.content,
-                                                   username: user_name.clone(),
-                                                   users: Vec::new(),
-                                                   to: None
-                                               };
+                                            // =================================
+                                            // Validate content
+                                            // =================================
 
-                                                let _ = sender.send(chat_message);
-                                           }
+                                            if incoming.content.trim().is_empty() {
+                                                println!(
+                                                    "[Room: {}] Empty message rejected",
+                                                    room_id
+                                                );
 
-                                           // =================================
-                                           // Private message
-                                           // =================================
-                                            else if incoming.message_type == "private_message" {
+                                                continue;
+                                            }
 
-                                               if let Some(target_username) = incoming.to {
-                                                   let target_senders = {
-                                                       let manager = manager.read().await;
+                                            // =================================
+                                            // Handle message type
+                                            // =================================
 
-                                                       manager.rooms.get(&room_id).map(|room| {
-                                                           room.clients
-                                                           .values()
-                                                           .filter(|client| client.username == target_username)
-                                                           .map(|client| client.sender.clone())
-                                                           .collect::<Vec<_>>()
-                                                       })
-                                                       .unwrap_or_default()
-                                                   };
+                                            match incoming.message_type {
 
-                                                   let private_message = ChatMessage {
-                                                       message_type: "private_message".to_string(),
-                                                       username: user_name.clone(),
-                                                       content: incoming.content,
-                                                       users: Vec::new(),
-                                                       to: Some(target_username.clone())
-                                                   };
+                                                // =================================
+                                                // Normal room message
+                                                // =================================
 
-                                                   for target_sender in target_senders {
-                                                       let _ = target_sender.send(private_message.clone());
-                                                   }
+                                                MessageType::Message => {
 
-                                               }
-                                               else {
-                                                   println!("[Room: {}] Unknown message type: {}", room_id, incoming.message_type);
-                                               }
-                                           }
-                                       }
-                                       Err(error) => {
-                                           println!("[Room: {}] Invalid JSON: {}", room_id, error);
-                                       }
+                                                    let chat_message = ChatMessage {
+                                                        message_type: "message".to_string(),
+                                                        content: incoming.content,
+                                                        username: user_name.clone(),
+                                                        users: Vec::new(),
+                                                        to: None,
+                                                    };
+
+                                                    // Save to history
+                                                    {
+                                                        let mut manager =
+                                                            manager.write().await;
+
+                                                        if let Some(room) =
+                                                            manager.rooms.get_mut(&room_id)
+                                                        {
+                                                            room.history.push_back(
+                                                                chat_message.clone()
+                                                            );
+
+                                                            // Keep only last 50 messages
+                                                            if room.history.len() > 50 {
+                                                                room.history.pop_front();
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // Broadcast to room
+                                                    let _ = sender.send(chat_message);
+                                                }
+
+                                                // =================================
+                                                // Private message
+                                                // =================================
+
+                                                MessageType::PrivateMessage => {
+
+                                                    let target_username =
+                                                        match incoming.to {
+
+                                                            Some(username) => username,
+
+                                                            None => {
+                                                                println!(
+                                                                    "[Room: {}] Private message missing target",
+                                                                    room_id
+                                                                );
+
+                                                                continue;
+                                                            }
+                                                        };
+
+                                                    // Find ALL connections of target user
+                                                    let target_senders = {
+
+                                                        let manager =
+                                                            manager.read().await;
+
+                                                        manager
+                                                            .rooms
+                                                            .get(&room_id)
+                                                            .map(|room| {
+
+                                                                room.clients
+                                                                    .values()
+                                                                    .filter(|client| {
+                                                                        client.username
+                                                                            == target_username
+                                                                    })
+                                                                    .map(|client| {
+                                                                        client.sender.clone()
+                                                                    })
+                                                                    .collect::<Vec<_>>()
+
+                                                            })
+                                                            .unwrap_or_default()
+                                                    };
+
+                                                    // Create private message
+                                                    let private_message = ChatMessage {
+                                                        message_type:
+                                                            "private_message".to_string(),
+
+                                                        username:
+                                                            user_name.clone(),
+
+                                                        content:
+                                                            incoming.content,
+
+                                                        users:
+                                                            Vec::new(),
+
+                                                        to:
+                                                            Some(
+                                                                target_username.clone()
+                                                            ),
+                                                    };
+
+                                                    // Send to all target connections
+                                                    for target_sender in target_senders {
+
+                                                        let _ =
+                                                            target_sender.send(
+                                                                private_message.clone()
+                                                            );
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        Err(error) => {
+
+                                            println!(
+                                                "[Room: {}] Invalid JSON: {}",
+                                                room_id,
+                                                error
+                                            );
+                                        }
                                     }
                                 }
                             }
+
                             Some(Err(error)) => {
-                                println!("[Room: {}] WebSocket error: {}", room_id, error);
+
+                                println!(
+                                    "[Room: {}] WebSocket error: {}",
+                                    room_id,
+                                    error
+                                );
+
                                 break;
                             }
+
                             None => {
-                                println!("[Room: {}] [{}] Client disconnected", user_name, room_id);
+
+                                println!(
+                                    "[Room: {}] [{}] Client disconnected",
+                                    room_id,
+                                    user_name
+                                );
+
                                 break;
                             }
                         }
@@ -301,7 +439,6 @@ fn websocket(ws: WebSocket, room_id: &str, user_name: &str, manager: &State<Arc<
 
 #[launch]
 fn rocket() -> _ {
-
     let manager = Arc::new(RwLock::new(RoomManager::new()));
 
     rocket::build()
